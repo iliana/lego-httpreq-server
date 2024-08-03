@@ -1,0 +1,26 @@
+[package]
+name = "lego-httpreq-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70.0"
+license-file = "LICENSE"
+publish = false
+resolver = "2"
+
+[profile.release]
+debug = 1
+lto = true
+
+[dependencies]
+async-trait = "0.1.67"
+axum = { version = "0.7.0", default-features = false, features = ["http1", "json", "tokio", "tracing"] }
+hickory-proto = { version = "0.24.0", features = ["serde-config"] }
+hickory-server = "0.24.0"
+serde = { version = "1.0.103", features = ["derive"] }
+tokio = { version = "1.39.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.0", default-features = false, features = ["ansi", "fmt", "std", "tracing-log"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+type-complexity = "allow"
