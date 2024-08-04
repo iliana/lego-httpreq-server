@@ -2,7 +2,7 @@
 name = "lego-httpreq-server"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.70.0"
+rust-version = "1.80.0"
 license-file = "LICENSE"
 publish = false
 resolver = "2"
@@ -20,7 +20,9 @@ serde = { version = "1.0.103", features = ["derive"] }
 tokio = { version = "1.39.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.0", default-features = false, features = ["ansi", "fmt", "std", "tracing-log"] }
+xflags = "0.4.0-pre.1"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+redundant-closure-for-method-calls = "allow"
 type-complexity = "allow"

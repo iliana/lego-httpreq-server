@@ -1,47 +1,39 @@
 use std::{collections::hash_map::Entry, collections::HashMap, sync::Arc};
 
 use axum::{extract::State, routing::post, Json, Router};
-use hickory_proto::op::ResponseCode::{NXDomain, NoError, NotImp, Refused};
-use hickory_proto::op::{Header, LowerQuery, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::{rdata, DNSClass, LowerName, Name, Record, RecordData, RecordType};
+use hickory_proto::op::{self, Header, LowerQuery, ResponseCode as RC};
+use hickory_proto::rr::{self, rdata, LowerName, Name, RData, Record, RecordType};
 use hickory_server::authority::MessageResponseBuilder;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use tracing::{debug, error, info, instrument, warn, Level};
 use tracing_subscriber::{filter::filter_fn, prelude::*};
 
-const USAGE: &str = "Options:
-      --debug, --no-debug      Print all tracing events (or don't) [env: HTTPREQ_DEBUG] [default: false]
-      --dns-addr <DNS_ADDR>    Address to serve DNS on [env: HTTPREQ_DNS_ADDR] [default: [::]:53]
-      --http-addr <HTTP_ADDR>  Address to serve the httpreq API on [env: HTTPREQ_HTTP_ADDR] [default: localhost:80]
-  -h, --help                   Print help";
+static N: std::sync::OnceLock<RData> = std::sync::OnceLock::new();
 
 #[tokio::main]
 async fn main() {
-    // Hell yeah let's do a hand-rolled arg parser with environment variables.
-    // (I think a Clap derive implementation is fewer LOC, but the binary bloat
-    // isn't worth it...)
-
-    // This variable is called `dbg` because if you call it `debug`, the tracing
-    // macro becomes upset.
-    let mut dbg = option_env("HTTPREQ_DEBUG")
-        .is_some_and(|x| x.parse().expect("could not parse HTTPREQ_DEBUG as bool"));
-    let mut dns_addr = option_env("HTTPREQ_DNS_ADDR").unwrap_or_else(|| "[::]:53".into());
-    let mut http_addr = option_env("HTTPREQ_HTTP_ADDR").unwrap_or_else(|| "localhost:80".into());
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => return println!("{USAGE}"),
-            s @ ("--debug" | "--no-debug") => dbg = s == "--debug",
-            "--dns-addr" => dns_addr = args.next().expect("--dns-addr requires an argument"),
-            "--http-addr" => http_addr = args.next().expect("--http-addr requires an argument"),
-            s => panic!("unrecognized option {s}"),
-        }
+    let args = xflags::parse_or_exit! {
+        /// Print all tracing events.
+        optional --debug
+        /// Address to serve DNS on. [default: [::]:53]
+        optional --dns-addr dns_addr: String
+        /// Address to serve the httpreq API on. [default: localhost:80]
+        optional --http-addr http_addr: String
+        /// Name to return in responses to NS queries for our zones.
+        optional ns_name: Name
+    };
+    let dns_addr = args.dns_addr.unwrap_or_else(|| "[::]:53".to_owned());
+    let http_addr = args.http_addr.unwrap_or_else(|| "localhost:80".to_owned());
+    if let Some(mut ns_name) = args.ns_name {
+        ns_name.set_fqdn(true);
+        N.set(RData::NS(rdata::NS(ns_name))).unwrap();
     }
+
     let layer = tracing_subscriber::fmt::layer().with_filter(filter_fn(move |meta| {
-        dbg || (meta.module_path() == Some(module_path!()) && *meta.level() <= Level::INFO)
+        args.debug || (meta.module_path() == Some(module_path!()) && *meta.level() <= Level::INFO)
     }));
     tracing_subscriber::registry().with(layer).init();
-    debug!(dbg, dns_addr, http_addr, "starting");
+    debug!(dns_addr, http_addr, name = N.get().map(|s| s.to_string()));
 
     let database = Database::default();
 
@@ -69,18 +61,10 @@ async fn main() {
     server.await.expect("HTTP server failed");
 }
 
-fn option_env(key: &str) -> Option<String> {
-    let f = |s| panic!("{key} is not valid unicode: {s:?}");
-    Some(std::env::var_os(key)?.into_string().unwrap_or_else(f))
-}
-
-// The Database is a set of zones, each of which is a single SOA record and a
-// Vec of TXT records.
-//
-// `[T; 1]` is a terrible type, but I can pass it around by reference as a slice
-// like I can with the Vec<T> for `txt`, which simplifies things quite a bit.
+// The Database is a set of zones. The first Vec in the zone array is the set of
+// TXT records; the second is the SOA record followed by an optional NS record.
 #[derive(Debug, Clone, Default)]
-struct Database(Arc<tokio::sync::RwLock<HashMap<LowerName, ([Record; 1], Vec<Record>)>>>);
+struct Database(Arc<tokio::sync::RwLock<HashMap<LowerName, [Vec<Record>; 2]>>>);
 
 // It's kind of amazing that this next line works at all. This aliases
 // `RwLockReadGuard` to the much shorter `Guard`, both for the type references
@@ -92,7 +76,7 @@ type Guard<'a, T = [Record]> = tokio::sync::RwLockReadGuard<'a, T>;
 // The response type for the `query` function, below. The `Result` is a slice of
 // `Record`s kept in an `RwLockReadGuard`; `Ok` means the records belong in the
 // answer section, and `Err` means the records belong in the authority section.
-type Response<'a> = (ResponseCode, Result<Guard<'a>, Guard<'a>>);
+type Response<'a> = (RC, Result<Guard<'a>, Guard<'a>>);
 
 // This is separate from `Database::handle_request` (below) so that it can be
 // tested. (It's not possible to construct a `Request` without decoding it from
@@ -109,16 +93,16 @@ async fn query<'a>(database: &'a Database, header: &Header, query: &LowerQuery) 
 
     // Filter out obviously-invalid messages.
     match (header.message_type(), header.op_code(), query.query_class()) {
-        (MessageType::Query, OpCode::Query, DNSClass::IN) => {}
-        _ => return (NotImp, Err(Guard::map(zones, |_| &[][..]))),
+        (op::MessageType::Query, op::OpCode::Query, rr::DNSClass::IN) => {}
+        _ => return (RC::NotImp, Err(Guard::map(zones, |_| &[][..]))),
     }
 
     match Guard::try_map(zones, |zones| zones.get(query.name())) {
-        Ok(zone) => match query.query_type() {
-            // Note `zone.0` is the SOA, and `zone.1` is the Vec of TXT records.
-            RecordType::SOA => (NoError, Ok(Guard::map(zone, |zone| &zone.0[..]))),
-            RecordType::TXT => (NoError, Ok(Guard::map(zone, |zone| &zone.1[..]))),
-            _ => (NoError, Err(Guard::map(zone, |zone| &zone.0[..]))),
+        Ok(z) => match query.query_type() {
+            RecordType::TXT => (RC::NoError, Ok(Guard::map(z, |z| &z[0][..]))),
+            RecordType::SOA => (RC::NoError, Ok(Guard::map(z, |z| &z[1][..1]))),
+            RecordType::NS if N.get().is_some() => (RC::NoError, Ok(Guard::map(z, |z| &z[1][1..]))),
+            _ => (RC::NoError, Err(Guard::map(z, |z| &z[1][..1]))),
         },
         Err(mut zones) => {
             // We won't have any answers, but we need to search to see if there
@@ -129,13 +113,13 @@ async fn query<'a>(database: &'a Database, header: &Header, query: &LowerQuery) 
                 match Guard::try_map(zones, |zones| zones.get(&name)) {
                     Ok(zone) => {
                         // We have an authority, but no records.
-                        return (NXDomain, Err(Guard::map(zone, |zone| &zone.0[..])));
+                        return (RC::NXDomain, Err(Guard::map(zone, |z| &z[1][..1])));
                     }
                     Err(locked_zones) => zones = locked_zones,
                 }
             }
             // We have no authority.
-            (Refused, Err(Guard::map(zones, |_| &[][..])))
+            (RC::Refused, Err(Guard::map(zones, |_| &[][..])))
         }
     }
 }
@@ -167,7 +151,7 @@ impl RequestHandler for Database {
         h.send_response(response).await.unwrap_or_else(|err| {
             error!(%err);
             let mut header = Header::response_from_request(req.header());
-            header.set_response_code(ResponseCode::ServFail);
+            header.set_response_code(RC::ServFail);
             header.into()
         })
     }
@@ -182,7 +166,7 @@ struct Body {
 #[instrument(skip(database))]
 async fn present(State(database): State<Database>, Json(Body { fqdn, value }): Json<Body>) {
     let mut zones = database.0.write().await;
-    let (_, txts) = zones.entry(fqdn.clone()).or_insert_with(|| {
+    let [txts, _] = zones.entry(fqdn.clone()).or_insert_with(|| {
         // Nearly none of the SOA record matters in practice:
         // 1. `mname` is used to know which server to send zone updates to; we
         //    don't accept updates.
@@ -198,26 +182,23 @@ async fn present(State(database): State<Database>, Json(Body { fqdn, value }): J
         // The one field that _does_ matter is `minimum`, which has since been
         // redefined by RFC 2308 to be the negative caching TTL.
         let soa = rdata::SOA::new(Name::root(), Name::root(), 1312, 3600, 3600, 3600, 5);
-        let soa = Record::from_rdata(fqdn.clone().into(), 5, soa);
-        ([soa.into_record_of_rdata()], Vec::with_capacity(1))
+        let mut vec = vec![Record::from_rdata(fqdn.clone().into(), 5, RData::SOA(soa))];
+        // Add the NS record, if one is set.
+        vec.extend((N.get().cloned()).map(|n| Record::from_rdata(fqdn.clone().into(), 5, n)));
+        [Vec::with_capacity(1), vec]
     });
-    let txt = Record::from_rdata(fqdn.into(), 5, rdata::TXT::new(vec![value]).into_rdata());
-    let Err(idx) = txts.binary_search(&txt) else {
-        return warn!(records = txts.len(), "record already exists");
-    };
-    txts.insert(idx, txt);
-    info!(records = txts.len());
+    let txt = Record::from_rdata(fqdn.into(), 5, RData::TXT(rdata::TXT::new(vec![value])));
+    let _ = txts.binary_search(&txt).map_err(|i| txts.insert(i, txt));
+    info!(len = txts.len());
 }
 
 #[instrument(skip(database))]
 async fn cleanup(State(database): State<Database>, Json(Body { fqdn, value }): Json<Body>) {
     if let Entry::Occupied(mut zone) = database.0.write().await.entry(fqdn.clone()) {
-        let txt = Record::from_rdata(fqdn.into(), 5, rdata::TXT::new(vec![value]).into_rdata());
-        if let Ok(index) = zone.get().1.binary_search(&txt) {
-            zone.get_mut().1.remove(index);
-            info!(records = zone.get().1.len());
-            zone.get().1.is_empty().then(|| zone.remove());
-        }
+        let txt = Record::from_rdata(fqdn.into(), 5, RData::TXT(rdata::TXT::new(vec![value])));
+        let _ = (zone.get()[0].binary_search(&txt)).map(|index| zone.get_mut()[0].remove(index));
+        info!(len = zone.get()[0].len());
+        zone.get()[0].is_empty().then(|| zone.remove());
     }
     warn!("no such record");
 }
@@ -225,65 +206,64 @@ async fn cleanup(State(database): State<Database>, Json(Body { fqdn, value }): J
 #[cfg(test)]
 #[tokio::test]
 async fn test() {
-    let name = "_acme-challenge.meow.";
-    let database = Database::default();
+    static DATABASE: std::sync::LazyLock<Database> = std::sync::LazyLock::new(Database::default);
 
-    macro_rules! call {
-        ($f:expr, $fqdn:expr, $value:expr) => {{
-            let (fqdn, value) = ($fqdn.parse().unwrap(), $value.into());
-            $f(State(database.clone()), Json(Body { fqdn, value }))
-        }};
-    }
-    macro_rules! check_query {
-        ($name:expr, $type:ident, $rcode:ident, $answers:expr, $soa:expr) => {{
-            let q = hickory_proto::op::Query::query($name.parse().unwrap(), RecordType::$type);
-            let (rcode, result) = query(&database, &Header::new(), &q.into()).await;
-            let [answers, soa] = split_result(&result);
-            assert_eq!(rcode, ResponseCode::$rcode, "rcode mismatch");
-            assert_eq!(answers.len(), $answers, "answers mismatch");
-            assert_eq!(soa.len(), usize::from($soa), "soa mismatch");
-        }};
+    fn b(fqdn: &str, value: &str) -> Json<Body> {
+        let (fqdn, value) = (fqdn.parse().unwrap(), value.to_owned());
+        Json(Body { fqdn, value })
     }
 
-    assert_eq!(database.0.read().await.len(), 0);
-    check_query!(name, SOA, Refused, 0, false);
-
-    // Add a record
-    let value_1 = "LHDhK3oGRvkiefQnx7OOczTY5Tic_xZ6HcMOc_gmtoM";
-    for _ in 0..2 {
-        call!(present, name, value_1).await;
-        check_query!(name, SOA, NoError, 1, false);
-        check_query!(name, TXT, NoError, 1, false);
-        check_query!(name, AAAA, NoError, 0, true);
-        check_query!(format!("subdomain.{name}"), SOA, NXDomain, 0, true);
+    async fn check(name: &str, ty: RecordType) -> (RC, usize, usize) {
+        let q = op::Query::query(name.parse().unwrap(), ty);
+        let (rcode, result) = query(&DATABASE, &Header::new(), &q.into()).await;
+        let [answers, soa] = split_result(&result);
+        (rcode, answers.len(), soa.len())
     }
 
-    // Add another record with the same FDQN, this time without the root label
-    // (it should be canonicalized)
-    let value_2 = "XaG3ZYfMMh2r9jvX961Z2nHDKcxXJm65_kLxolgb08k";
-    for _ in 0..2 {
-        call!(present, name.trim_end_matches('.'), value_2).await;
-        // Ensure there is only one zone in the database
-        assert_eq!(database.0.read().await.len(), 1);
-        // Two records are returned for the TXT query
-        check_query!(name, SOA, NoError, 1, false);
-        check_query!(name, TXT, NoError, 2, false);
-    }
+    let (n, s) = ("_acme-challenge.meow.", "subdomain._acme-challenge.meow.");
 
-    // Clean up the latter record
-    for _ in 0..2 {
-        call!(cleanup, name, value_2).await;
-        // The zone is still present
-        assert_eq!(database.0.read().await.len(), 1);
-        check_query!(name, SOA, NoError, 1, false);
-        check_query!(name, TXT, NoError, 1, false);
-    }
+    for i in 0..2 {
+        assert_eq!(DATABASE.0.read().await.len(), 0);
+        assert_eq!(check(n, RecordType::SOA).await, (RC::Refused, 0, 0));
 
-    // Clean up the original record
-    for _ in 0..2 {
-        call!(cleanup, name, value_1).await;
-        // The zone is deleted
-        assert_eq!(database.0.read().await.len(), 0);
-        check_query!(name, SOA, Refused, 0, false);
+        // Add a record
+        let value_1 = "LHDhK3oGRvkiefQnx7OOczTY5Tic_xZ6HcMOc_gmtoM";
+        for _ in 0..2 {
+            present(State(DATABASE.clone()), b(n, value_1)).await;
+            assert_eq!(check(n, RecordType::TXT).await, (RC::NoError, 1, 0));
+            assert_eq!(check(n, RecordType::SOA).await, (RC::NoError, 1, 0));
+            assert_eq!(check(n, RecordType::NS).await, (RC::NoError, i, i ^ 1));
+            assert_eq!(check(n, RecordType::AAAA).await, (RC::NoError, 0, 1));
+            assert_eq!(check(s, RecordType::SOA).await, (RC::NXDomain, 0, 1));
+        }
+
+        // Add another record with the same FDQN, this time without the root label
+        // (it should be canonicalized)
+        let value_2 = "XaG3ZYfMMh2r9jvX961Z2nHDKcxXJm65_kLxolgb08k";
+        for _ in 0..2 {
+            present(State(DATABASE.clone()), b(n.trim_end_matches('.'), value_2)).await;
+            // Ensure there is only one zone in the database
+            assert_eq!(DATABASE.0.read().await.len(), 1);
+            // Two records are returned for the TXT query
+            assert_eq!(check(n, RecordType::TXT).await, (RC::NoError, 2, 0));
+            assert_eq!(check(n, RecordType::SOA).await, (RC::NoError, 1, 0));
+        }
+
+        // Clean up the latter record
+        for _ in 0..2 {
+            cleanup(State(DATABASE.clone()), b(n, value_2)).await;
+            // The zone is still present
+            assert_eq!(DATABASE.0.read().await.len(), 1);
+            assert_eq!(check(n, RecordType::TXT).await, (RC::NoError, 1, 0));
+            assert_eq!(check(n, RecordType::SOA).await, (RC::NoError, 1, 0));
+        }
+
+        // Clean up the original record
+        for _ in 0..2 {
+            cleanup(State(DATABASE.clone()), b(n, value_1)).await;
+        }
+
+        // Before we run the second time, set `NS`
+        (N.set(RData::NS(rdata::NS("ns1.meow.".parse().unwrap())))).ok();
     }
 }
